@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Convert a .docx file, .html file, or the clipboard to pure Markdown.
 
-Rendering HTML tables as Markdown tables. With no input file given, reads
-the current clipboard contents (preferring rich HTML, falling back to
-plain text) and converts that instead.
+HTML tables become Markdown tables, and every other HTML tag is mapped to its
+Markdown equivalent (or to plain text / Unicode where Markdown has none), so
+the output contains no HTML tags. With no input file given, reads the current
+clipboard contents (preferring rich HTML, falling back to plain text) and
+converts that instead.
 """
 
 import argparse
@@ -13,7 +15,8 @@ import sys
 from pathlib import Path
 
 import mammoth
-from markdownify import markdownify
+from bs4 import BeautifulSoup, Comment
+from markdownify import MarkdownConverter
 
 
 def docx_to_html(path: Path) -> str:
@@ -22,14 +25,179 @@ def docx_to_html(path: Path) -> str:
     return result.value
 
 
+SUPERSCRIPTS = str.maketrans("0123456789+-=()ni", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱ")
+SUBSCRIPTS = str.maketrans("0123456789+-=()aeoxhklmnpst", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₒₓₕₖₗₘₙₚₛₜ")
+
+# Elements whose content must never reach the output.
+DROP_TAGS = ["script", "style", "noscript", "template", "head", "title", "meta", "link"]
+# Embedded media: Markdown can only link to them.
+MEDIA_TAGS = ("video", "audio", "iframe", "embed", "object", "source")
+
+
+def _script(text: str, table: dict, fallback_prefix: str) -> str:
+    """Use Unicode super/subscripts when every character maps, else `^(x)` / `_(x)`."""
+    if text.strip() and all(ord(c) in table or c == " " for c in text):
+        return text.translate(table)
+    return f"{fallback_prefix}({text})"
+
+
+class PureMarkdownConverter(MarkdownConverter):
+    """MarkdownConverter extended so no HTML tag survives into the output."""
+
+    # --- inline formatting that Markdown has no syntax for: keep the text -------
+    def convert_u(self, el, text, parent_tags):
+        return text
+
+    convert_ins = convert_mark = convert_small = convert_big = convert_span = convert_u
+    convert_font = convert_bdi = convert_bdo = convert_wbr = convert_u
+    convert_data = convert_time = convert_label = convert_u
+
+    def convert_sub(self, el, text, parent_tags):
+        return _script(text, SUBSCRIPTS, "_")
+
+    def convert_sup(self, el, text, parent_tags):
+        return _script(text, SUPERSCRIPTS, "^")
+
+    def convert_cite(self, el, text, parent_tags):
+        return self.convert_em(el, text, parent_tags)
+
+    convert_var = convert_dfn = convert_cite
+
+    def convert_kbd(self, el, text, parent_tags):
+        return self.convert_code(el, text, parent_tags)
+
+    convert_samp = convert_tt = convert_kbd
+
+    def convert_abbr(self, el, text, parent_tags):
+        title = (el.get("title") or "").strip()
+        return f"{text} ({title})" if title and title != text.strip() else text
+
+    convert_acronym = convert_abbr
+
+    def convert_ruby(self, el, text, parent_tags):
+        return text
+
+    def convert_rt(self, el, text, parent_tags):
+        return f"({text})" if text.strip() else ""
+
+    def convert_rp(self, el, text, parent_tags):
+        return ""
+
+    def convert_br(self, el, text, parent_tags):
+        if "_inline" in parent_tags or "td" in parent_tags or "th" in parent_tags:
+            return " "
+        return "\\\n"  # backslash hard break survives line-trimming
+
+    # --- blocks ---------------------------------------------------------------
+    def convert_details(self, el, text, parent_tags):
+        return f"\n\n{text.strip()}\n\n"
+
+    def convert_summary(self, el, text, parent_tags):
+        return f"\n\n**{text.strip()}**\n\n" if text.strip() else ""
+
+    def convert_figure(self, el, text, parent_tags):
+        return f"\n\n{text.strip()}\n\n"
+
+    def convert_figcaption(self, el, text, parent_tags):
+        return f"\n\n*{text.strip()}*\n\n" if text.strip() else ""
+
+    def convert_address(self, el, text, parent_tags):
+        return self.convert_p(el, text, parent_tags)
+
+    convert_section = convert_article = convert_header = convert_footer = MarkdownConverter.convert_div
+    convert_main = convert_aside = convert_nav = convert_fieldset = convert_center = MarkdownConverter.convert_div
+    convert_form = convert_legend = MarkdownConverter.convert_div
+    convert_menu = convert_dir = MarkdownConverter.convert_list
+
+    def convert_input(self, el, text, parent_tags):
+        if (el.get("type") or "").lower() in ("checkbox", "radio"):
+            return "[x]" if el.has_attr("checked") else "[ ]"
+        return ""
+
+    def convert_button(self, el, text, parent_tags):
+        return text
+
+    convert_select = convert_textarea = convert_option = convert_optgroup = convert_button
+
+    def _media(self, el, text, parent_tags):
+        src = el.get("src") or el.get("data") or ""
+        if not src:
+            source = el.find("source", src=True)
+            src = source["src"] if source else ""
+        if not src:
+            return text
+        label = (el.get("title") or el.get("alt") or text.strip() or src).strip()
+        return f"[{label}]({src})"
+
+    convert_video = convert_audio = convert_iframe = convert_embed = convert_object = _media
+
+    def convert_source(self, el, text, parent_tags):
+        return ""
+
+    convert_track = convert_param = convert_map = convert_area = convert_source
+
+    def convert_picture(self, el, text, parent_tags):
+        return text
+
+    def convert_svg(self, el, text, parent_tags):
+        return ""
+
+    convert_canvas = convert_svg
+
+    # --- tables ---------------------------------------------------------------
+    @staticmethod
+    def _cell_text(text: str) -> str:
+        text = re.sub(r"(?m)^\s*(?:[-*+]|\d+\.)\s+", "• ", text.strip())
+        text = re.sub(r"\s*\n\s*", " ", text)
+        return text.replace("|", "\\|")
+
+    def convert_td(self, el, text, parent_tags):
+        colspan = 1
+        if str(el.get("colspan", "")).isdigit():
+            colspan = max(1, min(1000, int(el["colspan"])))
+        return " " + self._cell_text(text) + " |" * colspan
+
+    convert_th = convert_td
+
+    def convert_caption(self, el, text, parent_tags):
+        return f"\n\n**{text.strip()}**\n\n" if text.strip() else ""
+
+    def convert_colgroup(self, el, text, parent_tags):
+        return ""
+
+    convert_col = convert_colgroup
+
+
+def _preprocess(html: str) -> BeautifulSoup:
+    soup = BeautifulSoup(html, "html.parser")
+    for node in soup.find_all(string=lambda s: isinstance(s, Comment)):
+        node.extract()
+    for el in soup(DROP_TAGS):
+        el.decompose()
+    for el in soup.find_all(attrs={"hidden": True}):
+        el.decompose()
+    # Prefer the <body> when a full document was supplied.
+    return soup.body or soup
+
+
+def _code_language(el) -> str:
+    code = el.find("code") or el
+    for cls in (code.get("class") or []) + (el.get("class") or []):
+        m = re.match(r"(?:language|lang|highlight-source)-(.+)", cls)
+        if m:
+            return m.group(1)
+    return ""
+
+
 def html_to_markdown(html: str) -> str:
-    md = markdownify(
-        html,
+    md = PureMarkdownConverter(
         heading_style="ATX",
         bullets="-",
-        strip=["script", "style"],
-    )
-    # Collapse 3+ blank lines down to 1, and trim trailing whitespace per line.
+        code_language_callback=_code_language,
+        newline_style="backslash",
+    ).convert_soup(_preprocess(html))
+    md = md.replace("\xa0", " ")
+    # Trim trailing whitespace per line and collapse 3+ blank lines down to 1.
     md = "\n".join(line.rstrip() for line in md.splitlines())
     md = re.sub(r"\n{3,}", "\n\n", md)
     return md.strip() + "\n"
