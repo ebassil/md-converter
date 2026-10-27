@@ -9,6 +9,7 @@ converts that instead.
 """
 
 import argparse
+import html as htmllib
 import re
 import subprocess
 import sys
@@ -32,6 +33,16 @@ SUBSCRIPTS = str.maketrans("0123456789+-=()aeoxhklmnpst", "₀₁₂₃₄₅₆
 DROP_TAGS = ["script", "style", "noscript", "template", "head", "title", "meta", "link"]
 # Embedded media: Markdown can only link to them.
 MEDIA_TAGS = ("video", "audio", "iframe", "embed", "object", "source")
+
+
+BLOCK_PARENTS = {"p", "div", "li", "td", "th", "blockquote", "section", "article", "body", "[document]"}
+# Tags that, appearing as literal text, mean the HTML was escaped or pasted as source.
+HTML_TAG_RE = re.compile(
+    r"</?(?:div|p|span|ul|ol|li|code|pre|table|tr|td|th|thead|tbody|h[1-6]|a|b|i|em|strong|br|hr|img|"
+    r"blockquote|section|article|details|summary|sub|sup|u|s|del|ins|mark|kbd|dl|dt|dd|figure|body|html)"
+    r"(?:\s[^<>]*)?/?>",
+    re.IGNORECASE,
+)
 
 
 def _script(text: str, table: dict, fallback_prefix: str) -> str:
@@ -62,6 +73,21 @@ class PureMarkdownConverter(MarkdownConverter):
         return self.convert_em(el, text, parent_tags)
 
     convert_var = convert_dfn = convert_cite
+
+    def convert_code(self, el, text, parent_tags):
+        # Fence multi-line code and code that stands alone in its block;
+        # <code> inside running prose stays an inline `span`.
+        if "pre" not in parent_tags and "_inline" not in parent_tags:
+            parent = el.parent
+            alone = (
+                parent is not None
+                and parent.name in BLOCK_PARENTS
+                and not parent.get_text(strip=True).replace(el.get_text(strip=True), "", 1)
+            )
+            if "\n" in text.strip() or alone:
+                lang = _code_language(el)
+                return f"\n\n```{lang}\n{text.strip(chr(10))}\n```\n\n"
+        return super().convert_code(el, text, parent_tags)
 
     def convert_kbd(self, el, text, parent_tags):
         return self.convert_code(el, text, parent_tags)
@@ -189,7 +215,7 @@ def _code_language(el) -> str:
     return ""
 
 
-def html_to_markdown(html: str) -> str:
+def html_to_markdown(html: str, _decoded: bool = False) -> str:
     md = PureMarkdownConverter(
         heading_style="ATX",
         bullets="-",
@@ -197,6 +223,10 @@ def html_to_markdown(html: str) -> str:
         newline_style="backslash",
     ).convert_soup(_preprocess(html))
     md = md.replace("\xa0", " ")
+    # Markup that arrived as escaped text (&lt;div&gt;) comes out as literal
+    # tags; decode it and convert once more.
+    if not _decoded and HTML_TAG_RE.search(htmllib.unescape(md)):
+        return html_to_markdown(htmllib.unescape(md.replace("\\_", "_")), _decoded=True)
     # Trim trailing whitespace per line and collapse 3+ blank lines down to 1.
     md = "\n".join(line.rstrip() for line in md.splitlines())
     md = re.sub(r"\n{3,}", "\n\n", md)
@@ -266,6 +296,8 @@ def convert_clipboard() -> str:
     text = get_clipboard_text()
     if not text.strip():
         raise ValueError("Clipboard is empty")
+    if HTML_TAG_RE.search(text):  # plain text that is really HTML source
+        return html_to_markdown(text)
     return text.strip() + "\n"
 
 
